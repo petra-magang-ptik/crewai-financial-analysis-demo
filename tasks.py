@@ -5,6 +5,7 @@ from textwrap import dedent
 class StockAnalysisTasks:
     def research(self, agent, company):
         return Task(
+            name="Collect and summarize recent news",
             description=dedent(
                 f"""
                     Collect and summarize recent news articles, press
@@ -19,8 +20,6 @@ class StockAnalysisTasks:
                     shifts in market sentiment, and potential impacts on 
                     the stock.
                     Also make sure to return the stock ticker.
-                    
-                    {self.__tip_section()}
             
                     Make sure to use the most recent data as possible.
             
@@ -33,6 +32,7 @@ class StockAnalysisTasks:
 
     def financial_analysis(self, agent, company):
         return Task(
+            name="Analyze the stock's financial health and market performance",
             description=dedent(
                 f"""
                     Conduct a thorough analysis of the {company} stock's financial
@@ -47,7 +47,7 @@ class StockAnalysisTasks:
                     but now including a clear assessment of the stock's
                     financial standing, its strengths and weaknesses, 
                     and how it fares against its competitors in the current
-                    market scenario.{self.__tip_section()}
+                    market scenario.
 
                     Make sure to use the most recent data possible.
                 """
@@ -58,6 +58,7 @@ class StockAnalysisTasks:
 
     def filings_analysis(self, agent, company):
         return Task(
+            name="Analyze recent 10-Q and 10-K filings from EDGAR",
             description=dedent(
                 f"""
                     Analyze the latest 10-Q and 10-K filings from EDGAR for
@@ -71,8 +72,7 @@ class StockAnalysisTasks:
                     Your final answer must be an expanded report that now
                     also highlights significant findings from these filings,
                     including any red flags or positive indicators for
-                    your customer.
-                    {self.__tip_section()}        
+                    your customer.     
                 """
             ),
             agent=agent,
@@ -81,6 +81,7 @@ class StockAnalysisTasks:
 
     def recommend(self, agent, company):
         return Task(
+            name="Synthesize analyses and provide a comprehensive investment recommendation",
             description=dedent(
                 f"""
                     Review and synthesize the analyses provided by the
@@ -99,7 +100,6 @@ class StockAnalysisTasks:
                     customer. It should be a full super detailed report, providing a 
                     clear investment stance and strategy with supporting evidence.
                     Make it pretty and well formatted for your customer.
-                    {self.__tip_section()}
                 """
             ),
             agent=agent,

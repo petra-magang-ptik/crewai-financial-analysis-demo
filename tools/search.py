@@ -97,7 +97,7 @@ class SearchNewsTool(BaseTool):
 class _YahooFinanceNewsToolInput(BaseModel):
     """Input for YahooFinanceNewsTool"""
 
-    query: str = Field(..., description="The query to search for news articles")
+    query: str = Field(..., description="The ticker symbol of the stock or company name")
 
 
 class YahooFinanceNewsTool(BaseTool):

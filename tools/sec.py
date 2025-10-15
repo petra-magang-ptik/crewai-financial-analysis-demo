@@ -1,16 +1,14 @@
 import os
-
-import requests
-from typing import Type
+from typing import Type, cast
 
 from pydantic import BaseModel, Field
 
 from langchain.text_splitter import CharacterTextSplitter
-from langchain_community.embeddings import OllamaEmbeddings
+from langchain_ollama.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import FAISS
 
-from sec_api import QueryApi
-from unstructured.partition.html import partition_html
+from edgar import Company, set_identity
+from edgar.entity.filings import EntityFiling
 
 from crewai.tools import BaseTool
 
@@ -21,32 +19,37 @@ class _SECToolInput(BaseModel):
     query: str = Field(..., description="Pipe-separated: TICKER|QUESTION")
 
 
-def _download_form_html(url: str) -> str:
-    headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
-        "Cache-Control": "max-age=0",
-        "Dnt": "1",
-        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"macOS"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
-
-    response = requests.get(url, headers=headers)
-    return response.text
+_IDENTITY_CACHE: dict[str, str] = {}
 
 
-def _embedding_search(url: str, ask: str) -> str:
-    text = _download_form_html(url)
-    elements = partition_html(text=text)
-    content = "\n".join([str(el) for el in elements])
+def _ensure_identity() -> str | None:
+    identity = (
+        os.environ.get("EDGAR_IDENTITY")
+        or os.environ.get("SEC_IDENTITY")
+        or os.environ.get("SEC_CONTACT")
+    )
+    if not identity:
+        return (
+            "EDGAR identity email missing. Set 'EDGAR_IDENTITY' (or SEC_IDENTITY/SEC_CONTACT) "
+            "environment variable so requests comply with SEC requirements."
+        )
+
+    cached = _IDENTITY_CACHE.get("value")
+    if cached == identity:
+        return None
+
+    try:
+        set_identity(identity)
+    except Exception as exc:  # pragma: no cover - defensive
+        return f"Failed to configure EDGAR identity: {exc}"
+
+    _IDENTITY_CACHE["value"] = identity
+    return None
+
+
+def _embedding_search(content: str, ask: str) -> str:
+    if not content:
+        return "Couldn't retrieve filing content for analysis."
     text_splitter = CharacterTextSplitter(
         separator="\n",
         chunk_size=1000,
@@ -55,10 +58,70 @@ def _embedding_search(url: str, ask: str) -> str:
         is_separator_regex=False,
     )
     docs = text_splitter.create_documents([content])
-    retriever = FAISS.from_documents(docs, OllamaEmbeddings(model="mxbai-embed-large")).as_retriever()
+    if not docs:
+        return "Filing content couldn't be segmented for retrieval."
+    retriever = FAISS.from_documents(
+        docs,
+        OllamaEmbeddings(
+            model=os.environ["EMBEDDING_MODEL"], base_url=os.environ["MODEL_BASE_URL"]
+        ),
+    ).as_retriever()
     answers = retriever.get_relevant_documents(ask, top_k=4)
     answers = "\n\n".join([a.page_content for a in answers])
-    return answers
+    return answers or "No relevant sections found in the filing."
+
+
+def _search_latest_form(stock: str, form: str, ask: str) -> str:
+    identity_error = _ensure_identity()
+    if identity_error:
+        return identity_error
+
+    ticker = stock.strip()
+    if not ticker:
+        return "Ticker symbol is missing. Provide the ticker before the question."
+
+    try:
+        company = Company(ticker)
+    except Exception as exc:  # pragma: no cover - depends on remote state
+        return f"Error locating company for ticker '{ticker}': {exc}"
+
+    if getattr(company, "not_found", False):
+        return f"Sorry, I couldn't find any company information for ticker '{ticker}'."
+
+    try:
+        filings = company.get_filings(form=form, amendments=False)
+    except Exception as exc:  # pragma: no cover - remote call
+        return f"Failed to retrieve {form} filings for '{ticker}': {exc}"
+
+    if len(filings) == 0:
+        return (
+            f"No {form} filings found for ticker '{ticker}'. The company may not have filed "
+            f"a {form} yet or it might use a different form type."
+        )
+
+    try:
+        filing = cast(EntityFiling, filings.latest())
+    except Exception as exc:  # pragma: no cover - library edge case
+        return f"Unable to determine the latest {form} filing for '{ticker}': {exc}"
+
+    try:
+        content = filing.text()
+    except Exception as text_exc:  # pragma: no cover - network edge cases
+        try:
+            content = filing.html() or ""
+        except Exception:
+            content = ""
+        if not content:
+            return f"Couldn't download the {form} filing content: {text_exc}"
+
+    context = _embedding_search(content, ask)
+    header = (
+        f"Ticker: {ticker.upper()}\n"
+        f"Company: {getattr(filing, 'company', 'Unknown')}\n"
+        f"Form: {filing.form} | Filed: {filing.filing_date}\n"
+        f"URL: {filing.filing_url}\n\n"
+    )
+    return header + context
 
 
 class Search10QTool(BaseTool):
@@ -76,23 +139,7 @@ class Search10QTool(BaseTool):
             stock, ask = query.split("|", 1)
         except ValueError:
             return "Input must be 'TICKER|QUESTION'"
-
-        queryApi = QueryApi(api_key=os.environ.get("SEC_API_API_KEY", ""))
-        q = {
-            "query": {"query_string": {"query": f'ticker:{stock} AND formType:"10-Q"'}},
-            "from": "0",
-            "size": "1",
-            "sort": [{"filedAt": {"order": "desc"}}],
-        }
-        resp = queryApi.get_filings(q)
-        fillings = resp.get("filings", []) if isinstance(resp, dict) else []
-        if len(fillings) == 0:
-            return "Sorry, I couldn't find any filing for this stock. Check if the ticker is correct."
-        link = fillings[0].get("linkToFilingDetails")
-        if not link:
-            return "Couldn't find a link to the filing details."
-
-        return _embedding_search(link, ask)
+        return _search_latest_form(stock, "10-Q", ask)
 
 
 class Search10KTool(BaseTool):
@@ -110,20 +157,4 @@ class Search10KTool(BaseTool):
             stock, ask = query.split("|", 1)
         except ValueError:
             return "Input must be 'TICKER|QUESTION'"
-
-        queryApi = QueryApi(api_key=os.environ.get("SEC_API_API_KEY", ""))
-        q = {
-            "query": {"query_string": {"query": f'ticker:{stock} AND formType:"10-K"'}},
-            "from": "0",
-            "size": "1",
-            "sort": [{"filedAt": {"order": "desc"}}],
-        }
-        resp = queryApi.get_filings(q)
-        fillings = resp.get("filings", []) if isinstance(resp, dict) else []
-        if len(fillings) == 0:
-            return "Sorry, I couldn't find any filing for this stock. Check if the ticker is correct."
-        link = fillings[0].get("linkToFilingDetails")
-        if not link:
-            return "Couldn't find a link to the filing details."
-
-        return _embedding_search(link, ask)
+        return _search_latest_form(stock, "10-K", ask)
